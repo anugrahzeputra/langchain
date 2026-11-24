@@ -10,7 +10,11 @@ from langchain_core.output_parsers.json import (
     SimpleJsonOutputParser,
 )
 from langchain_core.utils.function_calling import convert_to_openai_function
-from langchain_core.utils.json import parse_json_markdown, parse_partial_json
+from langchain_core.utils.json import (
+    parse_and_check_json_markdown,
+    parse_json_markdown,
+    parse_partial_json,
+)
 from tests.unit_tests.pydantic_utils import _schema
 
 GOOD_JSON = """```json
@@ -204,11 +208,18 @@ def test_parse_json_with_part_code_blocks() -> None:
 
 def test_parse_json_with_code_blocks_and_newlines() -> None:
     parsed = parse_json_markdown(JSON_WITH_MARKDOWN_CODE_BLOCK_AND_NEWLINES)
-
     assert parsed == {
         "action": "Final Answer",
         "action_input": '```bar\n<div id="1" class="value">\n\ttext\n</div>```',
     }
+
+
+def test_parse_non_dict_json_output() -> None:
+    text = "```json\n1\n```"
+    with pytest.raises(OutputParserException) as exc_info:
+        parse_and_check_json_markdown(text, expected_keys=["foo"])
+
+    assert "Expected JSON object (dict)" in str(exc_info.value)
 
 
 TEST_CASES_ESCAPED_QUOTES = [
@@ -242,6 +253,10 @@ TEST_CASES_PARTIAL = [
     ('{"foo": "bar", "bar":', '{"foo": "bar"}'),
     ('{"foo": "bar", "bar"', '{"foo": "bar"}'),
     ('{"foo": "bar", ', '{"foo": "bar"}'),
+    ('{"foo":"bar\\', '{"foo": "bar"}'),
+    ('{"foo": "bar"} Here is why.', '{"foo": "bar"}'),
+    ('{"foo": [1, 2, oops', '{"foo": [1, 2]}'),
+    ('{"foo": 1.', '{"foo": 1}'),
 ]
 
 
@@ -250,6 +265,33 @@ def test_parse_partial_json(json_strings: tuple[str, str]) -> None:
     case, expected = json_strings
     parsed = parse_partial_json(case)
     assert parsed == json.loads(expected)
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        '{"foo": "bar"} ' + "Here is why. " * 2_000,
+        '{"foo": [1, 2, ' + "x" * 20_000,
+        # Raw newlines become two-character escapes during repair, so the
+        # decoder's error offset runs ahead of the list index it maps to.
+        '{"foo": "' + "x\n" * 5_000 + '"} ' + "junk " * 2_000,
+    ],
+)
+def test_parse_partial_json_long_invalid_tail(
+    case: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A long unparseable tail must not cost one decode attempt per character."""
+    real_loads = json.loads
+    calls = 0
+
+    def counting_loads(*args: Any, **kwargs: Any) -> Any:
+        nonlocal calls
+        calls += 1
+        return real_loads(*args, **kwargs)
+
+    monkeypatch.setattr("langchain_core.utils.json.json.loads", counting_loads)
+    assert parse_partial_json(case) is not None
+    assert calls < 10
 
 
 STREAMED_TOKENS = """
@@ -613,6 +655,6 @@ def test_unicode_handling() -> None:
 
     parser = SimpleJsonOutputParser(pydantic_object=Sample)
     format_instructions = parser.get_format_instructions()
-    assert (
-        "科学文章的标题" in format_instructions
-    ), "Unicode characters should not be escaped"
+    assert "科学文章的标题" in format_instructions, (
+        "Unicode characters should not be escaped"
+    )

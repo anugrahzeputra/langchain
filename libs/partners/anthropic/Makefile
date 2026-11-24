@@ -1,17 +1,33 @@
-.PHONY: all format lint test tests integration_tests docker_tests help extended_tests
+.PHONY: all format lint type test tests integration_tests help extended_tests
 
 # Default target executed when no arguments are given to make.
 all: help
 
+.EXPORT_ALL_VARIABLES:
+UV_FROZEN = true
+
 # Define a variable for the test file path.
 TEST_FILE ?= tests/unit_tests/
+PYTEST_EXTRA ?=
 integration_test integration_tests: TEST_FILE=tests/integration_tests/
 
-test tests integration_test integration_tests:
-	poetry run pytest -vvv --timeout 10 $(TEST_FILE)
+SDK_SMOKE_TEST = tests/integration_tests/test_chat_models.py::test_stream
+
+test tests:
+	uv run --group test pytest -vvv $(PYTEST_EXTRA) --disable-socket --allow-unix-socket $(TEST_FILE)
+
+# Smoke each supported anthropic major first: 0.x is backed by `httpx`, 1.x by
+# `httpx2`, and uv.lock only ever resolves one of them.
+integration_test integration_tests:
+	uv run --with 'anthropic>=0.120.0,<1.0.0' --group test --group test_integration pytest -v --tb=short $(SDK_SMOKE_TEST)
+	uv run --with 'anthropic>=1.0.0,<2.0.0' --group test --group test_integration pytest -v --tb=short $(SDK_SMOKE_TEST)
+	uv run --group test --group test_integration pytest -v --tb=short -n auto --benchmark-disable --timeout 30 --retries 3 --retry-delay 1 $(TEST_FILE)
 
 test_watch:
-	poetry run ptw --snapshot-update --now . -- -vv $(TEST_FILE)
+	uv run --group test ptw --snapshot-update --now . -- -vv $(TEST_FILE)
+
+make benchmark:
+	uv run --group test pytest ./tests -m benchmark
 
 
 ######################
@@ -26,24 +42,28 @@ lint_diff format_diff: PYTHON_FILES=$(shell git diff --relative=libs/partners/an
 lint_package: PYTHON_FILES=langchain_anthropic
 lint_tests: PYTHON_FILES=tests
 lint_tests: MYPY_CACHE=.mypy_cache_test
+UV_RUN_LINT = uv run --all-groups
+UV_RUN_TYPE = uv run --all-groups
+lint_package lint_tests: UV_RUN_LINT = uv run --group lint
 
 lint lint_diff lint_package lint_tests:
-	[ "$(PYTHON_FILES)" = "" ] || poetry run ruff check $(PYTHON_FILES)
-	[ "$(PYTHON_FILES)" = "" ] || poetry run ruff format $(PYTHON_FILES) --diff
-	[ "$(PYTHON_FILES)" = "" ] || mkdir -p $(MYPY_CACHE) && poetry run mypy $(PYTHON_FILES) --cache-dir $(MYPY_CACHE)
+	./scripts/lint_imports.sh
+	[ "$(PYTHON_FILES)" = "" ] || $(UV_RUN_LINT) ruff check $(PYTHON_FILES)
+	[ "$(PYTHON_FILES)" = "" ] || $(UV_RUN_LINT) ruff format $(PYTHON_FILES) --diff
+	[ "$(PYTHON_FILES)" = "" ] || mkdir -p $(MYPY_CACHE) && $(UV_RUN_TYPE) mypy $(PYTHON_FILES) --cache-dir $(MYPY_CACHE)
+
+type:
+	mkdir -p $(MYPY_CACHE) && $(UV_RUN_TYPE) mypy $(PYTHON_FILES) --cache-dir $(MYPY_CACHE)
 
 format format_diff:
-	[ "$(PYTHON_FILES)" = "" ] || poetry run ruff format $(PYTHON_FILES)
-	[ "$(PYTHON_FILES)" = "" ] || poetry run ruff check --select I --fix $(PYTHON_FILES)
-
-spell_check:
-	poetry run codespell --toml pyproject.toml
-
-spell_fix:
-	poetry run codespell --toml pyproject.toml -w
+	[ "$(PYTHON_FILES)" = "" ] || $(UV_RUN_LINT) ruff format $(PYTHON_FILES)
+	[ "$(PYTHON_FILES)" = "" ] || $(UV_RUN_LINT) ruff check --fix $(PYTHON_FILES)
 
 check_imports: $(shell find langchain_anthropic -name '*.py')
-	poetry run python ./scripts/check_imports.py $^
+	$(UV_RUN_LINT) python ./scripts/check_imports.py $^
+
+check_version:
+	uv run python ./scripts/check_version.py
 
 ######################
 # HELP
@@ -51,9 +71,11 @@ check_imports: $(shell find langchain_anthropic -name '*.py')
 
 help:
 	@echo '----'
-	@echo 'check_imports				- check imports'
+	@echo 'check_imports                - check imports'
+	@echo 'check_version                - validate version consistency'
 	@echo 'format                       - run code formatters'
 	@echo 'lint                         - run linters'
+	@echo 'type                         - run type checking'
 	@echo 'test                         - run unit tests'
 	@echo 'tests                        - run unit tests'
 	@echo 'test TEST_FILE=<test_file>   - run all tests in file'

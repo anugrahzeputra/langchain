@@ -2,22 +2,35 @@ from __future__ import annotations  # type: ignore[import-not-found]
 
 import importlib.util
 import logging
-from typing import Any, Dict, Iterator, List, Mapping, Optional
+import warnings
+from collections.abc import Iterator, Mapping
+from typing import Any, Self
 
 from langchain_core.callbacks import CallbackManagerForLLMRun
 from langchain_core.language_models.llms import BaseLLM
 from langchain_core.outputs import Generation, GenerationChunk, LLMResult
 from pydantic import ConfigDict, model_validator
 
+from langchain_huggingface._version import __version__
+from langchain_huggingface.utils.import_utils import (
+    IMPORT_ERROR,
+    is_openvino_available,
+    is_optimum_intel_available,
+    is_optimum_intel_version,
+)
+
 DEFAULT_MODEL_ID = "gpt2"
 DEFAULT_TASK = "text-generation"
 VALID_TASKS = (
     "text2text-generation",
     "text-generation",
+    "image-text-to-text",
     "summarization",
     "translation",
 )
 DEFAULT_BATCH_SIZE = 4
+_MIN_OPTIMUM_VERSION = "1.21"
+
 
 logger = logging.getLogger(__name__)
 
@@ -25,44 +38,53 @@ logger = logging.getLogger(__name__)
 class HuggingFacePipeline(BaseLLM):
     """HuggingFace Pipeline API.
 
-    To use, you should have the ``transformers`` python package installed.
+    To use, you should have the `transformers` python package installed.
 
-    Only supports `text-generation`, `text2text-generation`, `summarization` and
-    `translation`  for now.
+    Only supports `text-generation`, `text2text-generation`, `image-text-to-text`,
+    `summarization` and `translation`  for now.
 
     Example using from_model_id:
-        .. code-block:: python
+        ```python
+        from langchain_huggingface import HuggingFacePipeline
 
-            from langchain_huggingface import HuggingFacePipeline
-            hf = HuggingFacePipeline.from_model_id(
-                model_id="gpt2",
-                task="text-generation",
-                pipeline_kwargs={"max_new_tokens": 10},
-            )
+        hf = HuggingFacePipeline.from_model_id(
+            model_id="gpt2",
+            task="text-generation",
+            pipeline_kwargs={"max_new_tokens": 10},
+        )
+        ```
+
     Example passing pipeline in directly:
-        .. code-block:: python
+        ```python
+        from langchain_huggingface import HuggingFacePipeline
+        from transformers import AutoModelForCausalLM, AutoTokenizer, pipeline
 
-            from langchain_huggingface import HuggingFacePipeline
-            from transformers import AutoModelForCausalLM, AutoTokenizer, pipeline
-
-            model_id = "gpt2"
-            tokenizer = AutoTokenizer.from_pretrained(model_id)
-            model = AutoModelForCausalLM.from_pretrained(model_id)
-            pipe = pipeline(
-                "text-generation", model=model, tokenizer=tokenizer, max_new_tokens=10
-            )
-            hf = HuggingFacePipeline(pipeline=pipe)
+        model_id = "gpt2"
+        tokenizer = AutoTokenizer.from_pretrained(model_id)
+        model = AutoModelForCausalLM.from_pretrained(model_id)
+        pipe = pipeline(
+            "text-generation",
+            model=model,
+            tokenizer=tokenizer,
+            max_new_tokens=10,
+        )
+        hf = HuggingFacePipeline(pipeline=pipe)
+        ```
     """
 
-    pipeline: Any = None  #: :meta private:
-    model_id: Optional[str] = None
+    pipeline: Any = None
+
+    model_id: str | None = None
     """The model name. If not set explicitly by the user,
     it will be inferred from the provided pipeline (if available).
     If neither is provided, the DEFAULT_MODEL_ID will be used."""
-    model_kwargs: Optional[dict] = None
+
+    model_kwargs: dict | None = None
     """Keyword arguments passed to the model."""
-    pipeline_kwargs: Optional[dict] = None
+
+    pipeline_kwargs: dict | None = None
     """Keyword arguments passed to the pipeline."""
+
     batch_size: int = DEFAULT_BATCH_SIZE
     """Batch size to use when passing multiple documents to generate."""
 
@@ -70,12 +92,18 @@ class HuggingFacePipeline(BaseLLM):
         extra="forbid",
     )
 
+    @model_validator(mode="after")
+    def _set_huggingface_version(self) -> Self:
+        """Set package version in metadata."""
+        self._add_version("langchain-huggingface", __version__)
+        return self
+
     @model_validator(mode="before")
     @classmethod
-    def pre_init_validator(cls, values: Dict[str, Any]) -> Dict[str, Any]:
+    def pre_init_validator(cls, values: dict[str, Any]) -> dict[str, Any]:
         """Ensure model_id is set either by pipeline or user input."""
         if "model_id" not in values:
-            if "pipeline" in values and values["pipeline"]:
+            if values.get("pipeline"):
                 values["model_id"] = values["pipeline"].model.name_or_path
             else:
                 values["model_id"] = DEFAULT_MODEL_ID
@@ -87,10 +115,10 @@ class HuggingFacePipeline(BaseLLM):
         model_id: str,
         task: str,
         backend: str = "default",
-        device: Optional[int] = None,
-        device_map: Optional[str] = None,
-        model_kwargs: Optional[dict] = None,
-        pipeline_kwargs: Optional[dict] = None,
+        device: int | None = None,
+        device_map: str | None = None,
+        model_kwargs: dict | None = None,
+        pipeline_kwargs: dict | None = None,
         batch_size: int = DEFAULT_BATCH_SIZE,
         **kwargs: Any,
     ) -> HuggingFacePipeline:
@@ -103,96 +131,94 @@ class HuggingFacePipeline(BaseLLM):
             )
             from transformers import pipeline as hf_pipeline  # type: ignore[import]
 
-        except ImportError:
-            raise ValueError(
+        except ImportError as e:
+            msg = (
                 "Could not import transformers python package. "
                 "Please install it with `pip install transformers`."
             )
+            raise ValueError(msg) from e
 
         _model_kwargs = model_kwargs.copy() if model_kwargs else {}
         if device_map is not None:
             if device is not None:
-                raise ValueError(
+                msg = (
                     "Both `device` and `device_map` are specified. "
                     "`device` will override `device_map`. "
                     "You will most likely encounter unexpected behavior."
                     "Please remove `device` and keep "
                     "`device_map`."
                 )
+                raise ValueError(msg)
 
             if "device_map" in _model_kwargs:
-                raise ValueError("`device_map` is already specified in `model_kwargs`.")
+                msg = "`device_map` is already specified in `model_kwargs`."
+                raise ValueError(msg)
 
             _model_kwargs["device_map"] = device_map
         tokenizer = AutoTokenizer.from_pretrained(model_id, **_model_kwargs)
 
-        try:
-            if task == "text-generation":
-                if backend == "openvino":
-                    try:
-                        from optimum.intel.openvino import (  # type: ignore[import]
-                            OVModelForCausalLM,
-                        )
+        if backend == "ipex":
+            msg = (
+                "`backend='ipex'` is no longer supported; the default "
+                "`transformers` backend will be used instead. Intel GPU acceleration "
+                "is natively supported in PyTorch 2.5 and later."
+            )
+            warnings.warn(msg, UserWarning, stacklevel=2)
+            backend = "default"
 
-                    except ImportError:
-                        raise ValueError(
-                            "Could not import optimum-intel python package. "
-                            "Please install it with: "
-                            "pip install 'optimum[openvino,nncf]' "
-                        )
-                    try:
-                        # use local model
-                        model = OVModelForCausalLM.from_pretrained(
-                            model_id, **_model_kwargs
-                        )
-
-                    except Exception:
-                        # use remote model
-                        model = OVModelForCausalLM.from_pretrained(
-                            model_id, export=True, **_model_kwargs
-                        )
-                else:
-                    model = AutoModelForCausalLM.from_pretrained(
-                        model_id, **_model_kwargs
-                    )
-            elif task in ("text2text-generation", "summarization", "translation"):
-                if backend == "openvino":
-                    try:
-                        from optimum.intel.openvino import OVModelForSeq2SeqLM
-
-                    except ImportError:
-                        raise ValueError(
-                            "Could not import optimum-intel python package. "
-                            "Please install it with: "
-                            "pip install 'optimum[openvino,nncf]' "
-                        )
-                    try:
-                        # use local model
-                        model = OVModelForSeq2SeqLM.from_pretrained(
-                            model_id, **_model_kwargs
-                        )
-
-                    except Exception:
-                        # use remote model
-                        model = OVModelForSeq2SeqLM.from_pretrained(
-                            model_id, export=True, **_model_kwargs
-                        )
-                else:
-                    model = AutoModelForSeq2SeqLM.from_pretrained(
-                        model_id, **_model_kwargs
-                    )
-            else:
-                raise ValueError(
+        if backend == "openvino":
+            if task not in VALID_TASKS:
+                msg = (
                     f"Got invalid task {task}, "
                     f"currently only {VALID_TASKS} are supported"
                 )
-        except ImportError as e:
-            raise ValueError(
-                f"Could not load the {task} model due to missing dependencies."
-            ) from e
+                raise ValueError(msg)
+
+            err_msg = f"Backend: {backend} {IMPORT_ERROR.format(f'optimum[{backend}]')}"
+            if not is_optimum_intel_available():
+                raise ImportError(err_msg)
+
+            if is_optimum_intel_version("<", _MIN_OPTIMUM_VERSION):
+                msg = (
+                    f"Backend: {backend} requires optimum-intel>="
+                    f"{_MIN_OPTIMUM_VERSION}. You can install it with pip: "
+                    "`pip install --upgrade --upgrade-strategy eager "
+                    f"`optimum[{backend}]`."
+                )
+                raise ImportError(msg)
+
+            if not is_openvino_available():
+                raise ImportError(err_msg)
+
+            from optimum.intel import (  # type: ignore[import]
+                OVModelForCausalLM,
+                OVModelForSeq2SeqLM,
+            )
+
+            model_cls = (
+                OVModelForCausalLM if task == "text-generation" else OVModelForSeq2SeqLM
+            )
+
+        else:
+            model_cls = (
+                AutoModelForCausalLM
+                if task == "text-generation"
+                else AutoModelForSeq2SeqLM
+            )
+
+        model = model_cls.from_pretrained(model_id, **_model_kwargs)
 
         if tokenizer.pad_token is None:
-            tokenizer.pad_token_id = model.config.eos_token_id
+            if model.config.pad_token_id is not None:
+                tokenizer.pad_token_id = model.config.pad_token_id
+            elif model.config.eos_token_id is not None and isinstance(
+                model.config.eos_token_id, int
+            ):
+                tokenizer.pad_token_id = model.config.eos_token_id
+            elif tokenizer.eos_token_id is not None:
+                tokenizer.pad_token_id = tokenizer.eos_token_id
+            else:
+                tokenizer.add_special_tokens({"pad_token": "[PAD]"})
 
         if (
             (
@@ -217,21 +243,28 @@ class HuggingFacePipeline(BaseLLM):
         ):
             import torch
 
-            cuda_device_count = torch.cuda.device_count()
-            if device < -1 or (device >= cuda_device_count):
-                raise ValueError(
+            # `torch.accelerator` (added in PyTorch 2.6) is device-agnostic and
+            # detects CUDA, XPU, and other accelerator backends.
+            if hasattr(torch, "accelerator"):
+                accelerator_device_count = torch.accelerator.device_count()
+            else:
+                accelerator_device_count = torch.cuda.device_count()
+            if device < -1 or (device >= accelerator_device_count):
+                msg = (
                     f"Got device=={device}, "
-                    f"device is required to be within [-1, {cuda_device_count})"
+                    f"device is required to be within [-1, {accelerator_device_count})"
                 )
+                raise ValueError(msg)
             if device_map is not None and device < 0:
                 device = None
-            if device is not None and device < 0 and cuda_device_count > 0:
+            if device is not None and device < 0 and accelerator_device_count > 0:
                 logger.warning(
-                    "Device has %d GPUs available. "
+                    "Device has %d accelerator(s) available. "
                     "Provide device={deviceId} to `from_model_id` to use available"
-                    "GPUs for execution. deviceId is -1 (default) for CPU and "
-                    "can be a positive integer associated with CUDA device id.",
-                    cuda_device_count,
+                    "accelerators for execution. deviceId is -1 (default) for CPU "
+                    "and can be a positive integer associated with the accelerator "
+                    "device id.",
+                    accelerator_device_count,
                 )
         if device is not None and device_map is not None and backend == "openvino":
             logger.warning("Please set device for OpenVINO through: `model_kwargs`")
@@ -240,7 +273,7 @@ class HuggingFacePipeline(BaseLLM):
                 k: v for k, v in _model_kwargs.items() if k != "trust_remote_code"
             }
         _pipeline_kwargs = pipeline_kwargs or {}
-        pipeline = hf_pipeline(
+        pipeline = hf_pipeline(  # type: ignore[call-overload]
             task=task,
             model=model,
             tokenizer=tokenizer,
@@ -250,10 +283,11 @@ class HuggingFacePipeline(BaseLLM):
             **_pipeline_kwargs,
         )
         if pipeline.task not in VALID_TASKS:
-            raise ValueError(
+            msg = (
                 f"Got invalid task {pipeline.task}, "
                 f"currently only {VALID_TASKS} are supported"
             )
+            raise ValueError(msg)
         return cls(
             pipeline=pipeline,
             model_id=model_id,
@@ -278,13 +312,13 @@ class HuggingFacePipeline(BaseLLM):
 
     def _generate(
         self,
-        prompts: List[str],
-        stop: Optional[List[str]] = None,
-        run_manager: Optional[CallbackManagerForLLMRun] = None,
+        prompts: list[str],
+        stop: list[str] | None = None,
+        run_manager: CallbackManagerForLLMRun | None = None,
         **kwargs: Any,
     ) -> LLMResult:
         # List to hold all results
-        text_generations: List[str] = []
+        text_generations: list[str] = []
         pipeline_kwargs = kwargs.get("pipeline_kwargs", {})
         skip_prompt = kwargs.get("skip_prompt", False)
 
@@ -303,19 +337,22 @@ class HuggingFacePipeline(BaseLLM):
                     # if model returns multiple generations, pick the top one
                     response = response[0]
 
-                if self.pipeline.task == "text-generation":
-                    text = response["generated_text"]
-                elif self.pipeline.task == "text2text-generation":
+                if (
+                    self.pipeline.task == "text-generation"
+                    or self.pipeline.task == "text2text-generation"
+                    or self.pipeline.task == "image-text-to-text"
+                ):
                     text = response["generated_text"]
                 elif self.pipeline.task == "summarization":
                     text = response["summary_text"]
                 elif self.pipeline.task in "translation":
                     text = response["translation_text"]
                 else:
-                    raise ValueError(
+                    msg = (
                         f"Got invalid task {self.pipeline.task}, "
                         f"currently only {VALID_TASKS} are supported"
                     )
+                    raise ValueError(msg)
                 if skip_prompt:
                     text = text[len(batch_prompts[j]) :]
                 # Append the processed text to results
@@ -328,8 +365,8 @@ class HuggingFacePipeline(BaseLLM):
     def _stream(
         self,
         prompt: str,
-        stop: Optional[List[str]] = None,
-        run_manager: Optional[CallbackManagerForLLMRun] = None,
+        stop: list[str] | None = None,
+        run_manager: CallbackManagerForLLMRun | None = None,
         **kwargs: Any,
     ) -> Iterator[GenerationChunk]:
         from threading import Thread
@@ -355,10 +392,7 @@ class HuggingFacePipeline(BaseLLM):
                 scores: torch.FloatTensor,
                 **kwargs: Any,
             ) -> bool:
-                for stop_id in stopping_ids_list:
-                    if input_ids[0][-1] == stop_id:
-                        return True
-                return False
+                return any(input_ids[0][-1] == stop_id for stop_id in stopping_ids_list)
 
         stopping_criteria = StoppingCriteriaList([StopOnTokens()])
 

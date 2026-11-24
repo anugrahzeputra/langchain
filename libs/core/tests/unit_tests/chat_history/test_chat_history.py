@@ -1,7 +1,34 @@
 from collections.abc import Sequence
 
-from langchain_core.chat_history import BaseChatMessageHistory
+import pytest
+
+from langchain_core.chat_history import (
+    BaseChatMessageHistory,
+    InMemoryChatMessageHistory,
+)
 from langchain_core.messages import BaseMessage, HumanMessage
+
+
+@pytest.mark.parametrize(
+    "history_class", [BaseChatMessageHistory, InMemoryChatMessageHistory]
+)
+def test_chat_history_deprecated(history_class: type[BaseChatMessageHistory]) -> None:
+    assert "deprecated" in (history_class.__doc__ or "")
+    assert "https://docs.langchain.com/oss/python/langchain/short-term-memory" in (
+        history_class.__doc__ or ""
+    )
+
+
+async def test_in_memory_history_initialization() -> None:
+    messages = [HumanMessage(content="Hello")]
+    history = InMemoryChatMessageHistory(messages=messages)
+    assert await history.aget_messages() == messages
+    other_history = InMemoryChatMessageHistory()
+    await other_history.aadd_messages([HumanMessage(content="World")])
+    assert history.messages == messages
+    await history.aclear()
+    assert history.messages == []
+    assert other_history.messages == [HumanMessage(content="World")]
 
 
 def test_add_message_implementation_only() -> None:
@@ -29,7 +56,10 @@ def test_add_message_implementation_only() -> None:
     assert store[1] == HumanMessage(content="World")
 
     chat_history.add_messages(
-        [HumanMessage(content="Hello"), HumanMessage(content="World")]
+        [
+            HumanMessage(content="Hello"),
+            HumanMessage(content="World"),
+        ]
     )
     assert len(store) == 4
     assert store[2] == HumanMessage(content="Hello")
@@ -61,7 +91,10 @@ def test_bulk_message_implementation_only() -> None:
     assert store[1] == HumanMessage(content="World")
 
     chat_history.add_messages(
-        [HumanMessage(content="Hello"), HumanMessage(content="World")]
+        [
+            HumanMessage(content="Hello"),
+            HumanMessage(content="World"),
+        ]
     )
     assert len(store) == 4
     assert store[2] == HumanMessage(content="Hello")
@@ -85,7 +118,10 @@ async def test_async_interface() -> None:
 
     chat_history = BulkAddHistory()
     await chat_history.aadd_messages(
-        [HumanMessage(content="Hello"), HumanMessage(content="World")]
+        [
+            HumanMessage(content="Hello"),
+            HumanMessage(content="World"),
+        ]
     )
     assert await chat_history.aget_messages() == [
         HumanMessage(content="Hello"),
